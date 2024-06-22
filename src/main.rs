@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use std::{
     fs,
     io::Write,
@@ -10,6 +10,7 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufWriter},
     net::UnixListener,
+    time,
 };
 use tokio::{net::UnixStream, process};
 
@@ -40,6 +41,28 @@ enum Subapp {
     Kill,
 }
 
+struct DropUnixListener {
+    path: PathBuf,
+    listener: UnixListener,
+}
+
+impl DropUnixListener {
+    fn bind(path: &PathBuf) -> Result<DropUnixListener> {
+        Ok(DropUnixListener {
+            path: path.clone(),
+            listener: UnixListener::bind(path)?,
+        })
+    }
+}
+
+impl Drop for DropUnixListener {
+    fn drop(&mut self) {
+        std::fs::remove_file(&self.path)
+            .expect(format!("Failed to remove {}", self.path.to_str().unwrap()).as_str());
+        println!("Removed {}", self.path.to_str().unwrap());
+    }
+}
+
 #[derive(Parser)]
 struct App {
     #[command(subcommand)]
@@ -48,6 +71,12 @@ struct App {
 
 #[tokio::main]
 async fn main() {
+    tokio::spawn(async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Program exited abnormally");
+        println!("Program terminated, exiting");
+    });
     let app = App::parse();
     match app.command {
         Subapp::Pause => {
@@ -70,7 +99,7 @@ async fn main() {
             directory,
         } => {
             if let Err(e) = init(&directory, interval.unwrap_or(60)).await {
-                eprintln!("Failed to start daemon: {}", e)
+                eprintln!("Daemon error: {}", e)
             }
         }
     }
@@ -92,7 +121,7 @@ async fn set_loop(files: Vec<PathBuf>, paused: Arc<Mutex<bool>>, interval: Durat
         let idx = rand::random::<usize>() % files.len();
         let img = files.get(idx).unwrap();
         let out = process::Command::new("swww")
-            .args(["img", "--transition-type", "fade"])
+            .args(["img", "--transition-type", "fade", img.to_str().unwrap()])
             .output()
             .await?;
         if !out.status.success() {
@@ -107,26 +136,11 @@ async fn set_loop(files: Vec<PathBuf>, paused: Arc<Mutex<bool>>, interval: Durat
     }
 }
 
-async fn init(dir: &PathBuf, interval: usize) -> Result<()> {
-    let socket = UnixListener::bind(get_socket_location()?)?;
-    let mut daemon_cmd = process::Command::new("swww-daemon").spawn()?;
-    let files = fs::read_dir(dir)?
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.is_file())
-        .collect::<Vec<_>>();
-    let paused = Arc::new(Mutex::new(false));
-    let set_loop = tokio::spawn(set_loop(
-        files,
-        paused.clone(),
-        Duration::from_secs(interval as u64),
-    ));
+async fn listen_loop(paused: Arc<Mutex<bool>>) -> Result<()> {
+    let socket_path = get_socket_location()?;
+    let socket = DropUnixListener::bind(&socket_path)?;
     loop {
-        let (stream, _) = socket.accept().await?;
-        if daemon_cmd.try_wait().is_ok_and(|c| c.is_some()) {
-            eprintln!("swww-daemon crashed, exiting");
-            break;
-        }
+        let (stream, _) = socket.listener.accept().await?;
         let mut reader = tokio::io::BufReader::new(stream);
         let mut buf = String::new();
         reader.read_line(&mut buf).await?;
@@ -137,8 +151,38 @@ async fn init(dir: &PathBuf, interval: usize) -> Result<()> {
             s => eprintln!("Unknown message received: {s}"),
         }
     }
-    set_loop.abort();
-    Ok(daemon_cmd.kill().await?)
+    Ok(())
+}
+
+async fn init(dir: &PathBuf, interval: usize) -> Result<()> {
+    let mut daemon_cmd = process::Command::new("swww-daemon")
+        .kill_on_drop(true)
+        .spawn()?;
+    let files = fs::read_dir(dir)?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .collect::<Vec<_>>();
+    let paused = Arc::new(Mutex::new(false));
+    let listen_task = tokio::spawn(listen_loop(paused.clone()));
+    let set_task = tokio::spawn(set_loop(
+        files,
+        paused.clone(),
+        Duration::from_secs(interval as u64),
+    ));
+    let mut ticker = time::interval(Duration::from_millis(100));
+    loop {
+        ticker.tick().await;
+        if daemon_cmd.try_wait()?.is_some() {
+            bail!("swww-daemon failed to run/crashed");
+        }
+        if listen_task.is_finished() {
+            return listen_task.await?;
+        }
+        if set_task.is_finished() {
+            return set_task.await?;
+        }
+    }
 }
 
 async fn send(msg: &str) -> Result<()> {
@@ -147,5 +191,6 @@ async fn send(msg: &str) -> Result<()> {
     let mut buf = Vec::<u8>::new();
     writeln!(&mut buf, "{msg}")?;
     writer.write_all(&buf).await?;
+    writer.flush().await?;
     Ok(())
 }

@@ -3,7 +3,7 @@
     naersk.url = "github:nix-community/naersk/master";
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     utils.url = "github:numtide/flake-utils";
-    swww.url = "github:LGFae.swww";
+    swww.url = "github:LGFae/swww";
   };
 
   outputs = {
@@ -21,6 +21,7 @@
       in {
         defaultPackage = naersk-lib.buildPackage {
           src = ./.;
+          nativeBuildInputs = [pkgs.makeWrapper];
           postInstall = ''
             wrapProgram $out/bin/wallswitcher \
               --set PATH ${lib.makeBinPath [
