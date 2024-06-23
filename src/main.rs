@@ -57,9 +57,14 @@ impl DropUnixListener {
 
 impl Drop for DropUnixListener {
     fn drop(&mut self) {
-        std::fs::remove_file(&self.path)
-            .expect(format!("Failed to remove {}", self.path.to_str().unwrap()).as_str());
-        println!("Removed {}", self.path.to_str().unwrap());
+        match std::fs::remove_file(&self.path) {
+            Ok(_) => {
+                println!("Removed {}", self.path.to_str().unwrap());
+            }
+            Err(e) => {
+                eprintln!("Failed to remove {}: {e}", self.path.to_str().unwrap())
+            }
+        }
     }
 }
 
@@ -106,7 +111,7 @@ async fn main() {
 }
 
 fn get_socket_location() -> Result<PathBuf> {
-    let runtime_dir = std::env::var(RUNTIME_DIR_KEY).map(|s| PathBuf::from(s))?;
+    let runtime_dir = std::env::var(RUNTIME_DIR_KEY).map(PathBuf::from)?;
     return Ok(runtime_dir.join(Path::new(SOCKET_NAME)));
 }
 
