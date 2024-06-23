@@ -76,12 +76,6 @@ struct App {
 
 #[tokio::main]
 async fn main() {
-    tokio::spawn(async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Program exited abnormally");
-        println!("Program terminated, exiting");
-    });
     let app = App::parse();
     match app.command {
         Subapp::Pause => {
@@ -160,6 +154,18 @@ async fn listen_loop(paused: Arc<Mutex<bool>>) -> Result<()> {
 }
 
 async fn init(dir: &PathBuf, interval: usize) -> Result<()> {
+    let sigint_handler = tokio::spawn(async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Program exited abnormally");
+        println!("Program terminated, exiting");
+    });
+    let sigterm_handler = tokio::spawn(async {
+        let mut stream = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to set up SIGTERM handler");
+        stream.recv().await;
+        println!("Program received SIGTERM, exiting");
+    });
     let mut daemon_cmd = process::Command::new("swww-daemon")
         .kill_on_drop(true)
         .spawn()?;
@@ -178,6 +184,9 @@ async fn init(dir: &PathBuf, interval: usize) -> Result<()> {
     let mut ticker = time::interval(Duration::from_millis(100));
     loop {
         ticker.tick().await;
+        if sigterm_handler.is_finished() || sigint_handler.is_finished() {
+            return Ok(());
+        }
         if daemon_cmd.try_wait()?.is_some() {
             bail!("swww-daemon failed to run/crashed");
         }
